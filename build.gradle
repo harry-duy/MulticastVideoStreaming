@@ -1,0 +1,49 @@
+plugins {
+    id 'java'
+    id 'application'
+    id 'org.openjfx.javafxplugin' version '0.0.13'
+}
+
+group = 'com.hutech.videostreaming'
+version = '1.0-SNAPSHOT'
+sourceCompatibility = '17'
+
+repositories {
+    mavenCentral()
+}
+
+javafx {
+    version = "17.0.8"
+    modules = ['javafx.controls', 'javafx.fxml', 'javafx.media', 'javafx.swing']
+}
+
+dependencies {
+    // MySQL Connector
+    implementation 'mysql:mysql-connector-java:8.0.33'
+
+    // Logging
+    implementation 'org.slf4j:slf4j-api:2.0.7'
+    implementation 'ch.qos.logback:logback-classic:1.4.8'
+
+    // Testing
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.9.2'
+
+    // Chart library
+    implementation 'org.jfree:jfreechart:1.5.4'
+}
+
+test {
+    useJUnitPlatform()
+}
+
+application {
+    mainClass = 'com.hutech.videostreaming.Main'
+}
+
+// QUAN TRỌNG: Thêm phần này để JavaFX chạy được
+tasks.withType(JavaExec) {
+    jvmArgs = [
+            '--module-path', configurations.runtimeClasspath.asPath,
+            '--add-modules', 'javafx.controls,javafx.fxml,javafx.media,javafx.swing'
+    ]
+}
