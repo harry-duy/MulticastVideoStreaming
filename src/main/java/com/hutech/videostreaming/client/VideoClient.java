@@ -4,26 +4,38 @@ import com.hutech.videostreaming.common.*;
 import java.io.*;
 import java.net.*;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 
 public class VideoClient {
     private MulticastSocket socket;
     private InetAddress group;
     private DatabaseManager dbManager;
     private volatile boolean isReceiving = false;
-    private List<VideoPacket> receivedPackets;
+    private volatile boolean isStreamActive = false;
+    private Map<Integer, VideoPacket> receivedPackets; // Use Map for faster access
     private ClientCallback callback;
     private String clientIp;
+
+    // Statistics
     private int packetsReceived = 0;
     private int droppedPackets = 0;
     private int lastSequenceNumber = -1;
+    private int expectedTotalPackets = 0;
 
-    // ===== Auto-Reconnect variables =====
+    // Auto-reconnect settings
     private volatile boolean autoReconnect = true;
     private int reconnectAttempts = 0;
     private static final int MAX_RECONNECT_ATTEMPTS = 5;
 
-    // ===== Interface for GUI callbacks =====
+    // Timeout detection
+    private long lastPacketTime = 0;
+    private static final long STREAM_TIMEOUT = 5000; // 5 seconds
+
+    // Bandwidth monitor
+    private BandwidthMonitor bandwidthMonitor;
+
     public interface ClientCallback {
         void onConnected();
         void onStreamStarted();
@@ -37,13 +49,12 @@ public class VideoClient {
 
     public VideoClient(ClientCallback callback) {
         this.callback = callback;
-        this.receivedPackets = new CopyOnWriteArrayList<>();
+        this.receivedPackets = new ConcurrentHashMap<>();
         this.dbManager = new DatabaseManager();
+        this.bandwidthMonitor = new BandwidthMonitor();
     }
 
-    /**
-     * Kết nối vào nhóm multicast
-     */
+    /** Connect to multicast group */
     public void connect() {
         try {
             socket = new MulticastSocket(null);
@@ -52,50 +63,57 @@ public class VideoClient {
 
             group = InetAddress.getByName(Constants.MULTICAST_ADDRESS);
 
-            // Select appropriate NIC for multicast
+            // Select appropriate network interface
             NetworkInterface networkInterface = findMulticastInterface();
             if (networkInterface != null) {
                 socket.setNetworkInterface(networkInterface);
+
+                // Join multicast group on specific interface
                 try {
                     socket.joinGroup(new InetSocketAddress(group, Constants.MULTICAST_PORT), networkInterface);
                 } catch (Throwable t) {
                     // Fallback for older JDKs
                     socket.joinGroup(group);
                 }
+
                 clientIp = getFirstIPv4Address(networkInterface);
+
+                System.out.println("🧩 [CLIENT] Using network interface: " +
+                        networkInterface.getName() + " (" + networkInterface.getDisplayName() + ")");
             } else {
                 // Fallback to default
                 socket.joinGroup(group);
                 clientIp = InetAddress.getLocalHost().getHostAddress();
+                System.out.println("⚠️ [CLIENT] Using default network interface");
             }
 
-            // Increase receive buffer to reduce drops under bursty load
+            // Increase receive buffer to reduce packet drops
             try {
-                socket.setReceiveBufferSize(4 * 1024 * 1024);
-            } catch (Exception ignore) {}
+                socket.setReceiveBufferSize(8 * 1024 * 1024); // 8MB
+                System.out.println("🧪 [CLIENT] Receive buffer: " + socket.getReceiveBufferSize());
+            } catch (Exception e) {
+                System.out.println("⚠️ [CLIENT] Could not set receive buffer size");
+            }
+
+            // Set socket timeout for better error detection
+            socket.setSoTimeout(1000); // 1 second timeout
 
             System.out.println("✅ [CLIENT] Connected to multicast group");
             System.out.println("📡 Address: " + Constants.MULTICAST_ADDRESS);
             System.out.println("🔌 Port: " + Constants.MULTICAST_PORT);
             System.out.println("💻 Local IP: " + clientIp);
-            try {
-                System.out.println("🧪 [CLIENT] RecvBuf: " + socket.getReceiveBufferSize());
-                if (networkInterface != null) {
-                    System.out.println("🧩 [CLIENT] NIC: " + networkInterface.getName() +
-                            " (" + networkInterface.getDisplayName() + ")");
-                }
-            } catch (Exception ignore) {}
 
             dbManager.recordClientJoin(clientIp);
             dbManager.logEvent("CONNECT", clientIp, "Client joined multicast group");
 
-            reconnectAttempts = 0; // reset attempts on success
+            reconnectAttempts = 0;
 
             if (callback != null) {
                 callback.onConnected();
             }
 
             startReceiving();
+            startTimeoutMonitor();
 
         } catch (IOException e) {
             System.err.println("❌ [CLIENT] Connection failed: " + e.getMessage());
@@ -105,14 +123,68 @@ public class VideoClient {
         }
     }
 
-    /**
-     * Bắt đầu nhận packets từ multicast
-     */
+    /** Find suitable network interface */
+    private static NetworkInterface findMulticastInterface() {
+        try {
+            List<NetworkInterface> candidates = new ArrayList<>();
+
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces.hasMoreElements()) {
+                NetworkInterface nif = interfaces.nextElement();
+
+                if (!nif.isUp() || nif.isLoopback() || nif.isVirtual()) continue;
+                if (!nif.supportsMulticast()) continue;
+
+                // Check for IPv4 address
+                Enumeration<InetAddress> addrs = nif.getInetAddresses();
+                boolean hasIPv4 = false;
+                while (addrs.hasMoreElements()) {
+                    InetAddress addr = addrs.nextElement();
+                    if (addr instanceof Inet4Address && !addr.isLoopbackAddress()) {
+                        hasIPv4 = true;
+                        break;
+                    }
+                }
+
+                if (hasIPv4) {
+                    candidates.add(nif);
+                }
+            }
+
+            // Prefer ethernet/wifi interfaces
+            for (NetworkInterface nif : candidates) {
+                String name = nif.getName().toLowerCase();
+                if (name.contains("eth") || name.contains("en") || name.contains("wlan") || name.contains("wi")) {
+                    return nif;
+                }
+            }
+
+            return candidates.isEmpty() ? null : candidates.get(0);
+
+        } catch (SocketException e) {
+            return null;
+        }
+    }
+
+    /** Get first IPv4 address from interface */
+    private static String getFirstIPv4Address(NetworkInterface nif) {
+        if (nif == null) return null;
+        Enumeration<InetAddress> addrs = nif.getInetAddresses();
+        while (addrs.hasMoreElements()) {
+            InetAddress addr = addrs.nextElement();
+            if (addr instanceof Inet4Address && !addr.isLoopbackAddress()) {
+                return addr.getHostAddress();
+            }
+        }
+        return null;
+    }
+
+    /** Start receiving packets */
     private void startReceiving() {
         isReceiving = true;
 
         new Thread(() -> {
-            byte[] buffer = new byte[Constants.MAX_PACKET_SIZE + Constants.HEADER_SIZE];
+            byte[] buffer = new byte[Constants.MAX_PACKET_SIZE + Constants.HEADER_SIZE + 40000]; // Extra buffer
             System.out.println("🎧 [CLIENT] Listening for packets...");
 
             while (isReceiving) {
@@ -120,25 +192,30 @@ public class VideoClient {
                     DatagramPacket dgPacket = new DatagramPacket(buffer, buffer.length);
                     socket.receive(dgPacket);
 
+                    lastPacketTime = System.currentTimeMillis();
+
+                    // Parse packet
                     VideoPacket packet = VideoPacket.fromByteArray(buffer, dgPacket.getLength());
                     handlePacket(packet);
+
+                } catch (SocketTimeoutException e) {
+                    // This is normal - just checking for stop condition
+                    continue;
 
                 } catch (SocketException e) {
                     if (isReceiving) {
                         System.err.println("❌ [CLIENT] Socket error: " + e.getMessage());
-                        if (autoReconnect) {
-                            System.err.println("🔄 [CLIENT] Connection lost. Attempting reconnect...");
-                            if (callback != null) {
-                                callback.onError("Connection lost. Attempting to reconnect...");
-                            }
+                        if (autoReconnect && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                            System.err.println("🔄 [CLIENT] Attempting reconnect...");
                             attemptReconnect();
                         } else {
                             if (callback != null) {
-                                callback.onError("Connection lost. Auto-reconnect disabled.");
+                                callback.onError("Connection lost");
                             }
                         }
                         break;
                     }
+
                 } catch (IOException e) {
                     if (isReceiving) {
                         System.err.println("❌ [CLIENT] Error receiving packet: " + e.getMessage());
@@ -147,139 +224,175 @@ public class VideoClient {
             }
 
             System.out.println("🔇 [CLIENT] Stopped listening");
-        }).start();
+        }, "ClientReceiveThread").start();
     }
 
-    private static NetworkInterface findMulticastInterface() {
-        try {
-            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
-            while (interfaces.hasMoreElements()) {
-                NetworkInterface nif = interfaces.nextElement();
-                if (!nif.isUp() || nif.isLoopback() || nif.isVirtual()) continue;
-                if (!nif.supportsMulticast()) continue;
-                // Prefer interface with an IPv4 address
-                Enumeration<InetAddress> addrs = nif.getInetAddresses();
-                while (addrs.hasMoreElements()) {
-                    InetAddress addr = addrs.nextElement();
-                    if (addr instanceof Inet4Address) {
-                        return nif;
+    /** Monitor for stream timeout */
+    private void startTimeoutMonitor() {
+        new Thread(() -> {
+            while (isReceiving) {
+                try {
+                    Thread.sleep(1000);
+
+                    if (isStreamActive && lastPacketTime > 0) {
+                        long timeSinceLastPacket = System.currentTimeMillis() - lastPacketTime;
+                        if (timeSinceLastPacket > STREAM_TIMEOUT) {
+                            System.err.println("⚠️ [CLIENT] Stream timeout detected");
+                            isStreamActive = false;
+
+                            if (callback != null) {
+                                callback.onError("Stream timeout - no packets received");
+                            }
+                        }
                     }
+                } catch (InterruptedException e) {
+                    break;
                 }
             }
-        } catch (SocketException ignored) {}
-        return null;
+        }, "ClientTimeoutMonitor").start();
     }
 
-    private static String getFirstIPv4Address(NetworkInterface nif) {
-        if (nif == null) return null;
-        Enumeration<InetAddress> addrs = nif.getInetAddresses();
-        while (addrs.hasMoreElements()) {
-            InetAddress addr = addrs.nextElement();
-            if (addr instanceof Inet4Address) {
-                return addr.getHostAddress();
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Tự động reconnect sau khi mất kết nối
-     */
+    /** Attempt to reconnect */
     private void attemptReconnect() {
         if (!autoReconnect || reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-            System.err.println("🚫 [CLIENT] Reconnect attempts exceeded or disabled.");
-            if (callback != null) callback.onError("Max reconnect attempts reached.");
+            System.err.println("🚫 [CLIENT] Max reconnect attempts reached");
+            if (callback != null) {
+                callback.onError("Failed to reconnect after " + MAX_RECONNECT_ATTEMPTS + " attempts");
+            }
             return;
         }
 
         reconnectAttempts++;
-        System.out.println("🔄 [CLIENT] Attempting to reconnect... (" +
-                reconnectAttempts + "/" + MAX_RECONNECT_ATTEMPTS + ")");
+        System.out.println("🔄 [CLIENT] Reconnect attempt " + reconnectAttempts + "/" + MAX_RECONNECT_ATTEMPTS);
 
         new Thread(() -> {
             try {
-                Thread.sleep(3000); // wait 3 seconds
-                connect(); // reconnect
-                reconnectAttempts = 0;
+                Thread.sleep(3000); // Wait 3 seconds before reconnecting
+                connect();
             } catch (InterruptedException e) {
-                System.err.println("⚠️ [CLIENT] Reconnect thread interrupted.");
+                Thread.currentThread().interrupt();
             }
         }).start();
     }
 
-    /**
-     * Xử lý packet nhận được
-     */
+    /** Handle received packet */
     private void handlePacket(VideoPacket packet) {
         switch (packet.getCommand()) {
             case Constants.CMD_START:
-                System.out.println("▶️ [CLIENT] Stream started");
-                packetsReceived = 0;
-                droppedPackets = 0;
-                lastSequenceNumber = -1;
-                receivedPackets.clear();
-
-                dbManager.logEvent("STREAM_START", clientIp, "Stream started");
-
-                if (callback != null) {
-                    callback.onStreamStarted();
-                }
+                handleStreamStart();
                 break;
 
             case Constants.CMD_DATA:
-                if (lastSequenceNumber != -1) {
-                    int expected = lastSequenceNumber + 1;
-                    if (packet.getSequenceNumber() > expected) {
-                        droppedPackets += (packet.getSequenceNumber() - expected);
-                    }
-                }
-
-                lastSequenceNumber = packet.getSequenceNumber();
-                packetsReceived++;
-                receivedPackets.add(packet);
-
-                if (packetsReceived % 50 == 0) {
-                    System.out.println("📥 [CLIENT] Received " + packetsReceived +
-                            " packets (dropped: " + droppedPackets + ")");
-                    dbManager.updatePacketCount(clientIp, packetsReceived);
-                }
-
-                if (callback != null) {
-                    callback.onPacketReceived(packet, packetsReceived, droppedPackets);
-                }
+                handleDataPacket(packet);
                 break;
 
             case Constants.CMD_PAUSE:
-                System.out.println("⏸️ [CLIENT] Stream paused");
-                dbManager.logEvent("STREAM_PAUSE", clientIp, "Stream paused");
-                if (callback != null) callback.onStreamPaused();
+                handleStreamPause();
                 break;
 
             case Constants.CMD_RESUME:
-                System.out.println("▶️ [CLIENT] Stream resumed");
-                dbManager.logEvent("STREAM_RESUME", clientIp, "Stream resumed");
-                if (callback != null) callback.onStreamResumed();
+                handleStreamResume();
                 break;
 
             case Constants.CMD_STOP:
-                System.out.println("⏹️ [CLIENT] Stream stopped");
-                System.out.println("📊 Total received: " + packetsReceived);
-                System.out.println("📊 Total dropped: " + droppedPackets);
-
-                dbManager.logEvent("STREAM_STOP", clientIp,
-                        "Stream stopped. Received: " + packetsReceived +
-                                ", Dropped: " + droppedPackets);
-
-                if (callback != null) callback.onStreamStopped();
+                handleStreamStop();
                 break;
         }
     }
 
-    /**
-     * Ngắt kết nối khỏi nhóm multicast
-     */
+    private void handleStreamStart() {
+        System.out.println("▶️ [CLIENT] Stream started");
+        isStreamActive = true;
+        packetsReceived = 0;
+        droppedPackets = 0;
+        lastSequenceNumber = -1;
+        expectedTotalPackets = 0;
+        receivedPackets.clear();
+        bandwidthMonitor.reset();
+
+        dbManager.logEvent("STREAM_START", clientIp, "Stream started");
+
+        if (callback != null) {
+            callback.onStreamStarted();
+        }
+    }
+
+    private void handleDataPacket(VideoPacket packet) {
+        if (!isStreamActive) {
+            isStreamActive = true; // Auto-start if we receive data
+        }
+
+        int currentSeq = packet.getSequenceNumber();
+
+        // Check for dropped packets
+        if (lastSequenceNumber >= 0 && currentSeq > lastSequenceNumber + 1) {
+            int dropped = currentSeq - lastSequenceNumber - 1;
+            droppedPackets += dropped;
+
+            System.out.println("⚠️ [CLIENT] Detected " + dropped + " dropped packets " +
+                    "(expected: " + (lastSequenceNumber + 1) + ", got: " + currentSeq + ")");
+        }
+
+        // Store packet
+        receivedPackets.put(currentSeq, packet);
+        lastSequenceNumber = Math.max(lastSequenceNumber, currentSeq);
+        packetsReceived++;
+
+        // Update bandwidth
+        if (packet.getData() != null) {
+            bandwidthMonitor.addData(packet.getDataLength());
+        }
+
+        // Log progress
+        if (packetsReceived % 50 == 0) {
+            System.out.println("📥 [CLIENT] Received " + packetsReceived +
+                    " packets (dropped: " + droppedPackets +
+                    ", bandwidth: " + bandwidthMonitor.getFormattedBandwidth() + ")");
+            dbManager.updatePacketCount(clientIp, packetsReceived);
+        }
+
+        if (callback != null) {
+            callback.onPacketReceived(packet, packetsReceived, droppedPackets);
+        }
+    }
+
+    private void handleStreamPause() {
+        System.out.println("⏸️ [CLIENT] Stream paused");
+        dbManager.logEvent("STREAM_PAUSE", clientIp, "Stream paused");
+        if (callback != null) callback.onStreamPaused();
+    }
+
+    private void handleStreamResume() {
+        System.out.println("▶️ [CLIENT] Stream resumed");
+        isStreamActive = true;
+        dbManager.logEvent("STREAM_RESUME", clientIp, "Stream resumed");
+        if (callback != null) callback.onStreamResumed();
+    }
+
+    private void handleStreamStop() {
+        System.out.println("⏹️ [CLIENT] Stream stopped");
+        isStreamActive = false;
+
+        System.out.println("📊 [CLIENT] Final statistics:");
+        System.out.println("   Total received: " + packetsReceived);
+        System.out.println("   Total dropped: " + droppedPackets);
+
+        double successRate = packetsReceived > 0 ?
+                (packetsReceived * 100.0 / (packetsReceived + droppedPackets)) : 0;
+        System.out.println("   Success rate: " + String.format("%.2f%%", successRate));
+        System.out.println("   Avg bandwidth: " + bandwidthMonitor.getFormattedBandwidth());
+
+        dbManager.logEvent("STREAM_STOP", clientIp,
+                String.format("Stream stopped. Received: %d, Dropped: %d, Success rate: %.2f%%",
+                        packetsReceived, droppedPackets, successRate));
+
+        if (callback != null) callback.onStreamStopped();
+    }
+
+    /** Disconnect from multicast group */
     public void disconnect() {
         isReceiving = false;
+        isStreamActive = false;
 
         try {
             if (socket != null && group != null) {
@@ -300,118 +413,131 @@ public class VideoClient {
         }
     }
 
-    /**
-     * Lưu video đã nhận vào file
-     */
+    /** Save received video to file */
     public void saveReceivedVideo(String outputPath) {
         try {
             System.out.println("💾 [CLIENT] Starting video save process...");
-            System.out.println("📦 [CLIENT] Total packets collected: " + receivedPackets.size());
+            System.out.println("📦 [CLIENT] Total unique packets: " + receivedPackets.size());
 
             if (receivedPackets.isEmpty()) {
                 System.err.println("❌ [CLIENT] No packets to save!");
+                if (callback != null) {
+                    callback.onError("No video data to save");
+                }
                 return;
             }
 
-            // Bước 1: Sắp xếp packets
-            System.out.println("🔄 [CLIENT] Sorting packets...");
-            receivedPackets.sort(Comparator.comparingInt(VideoPacket::getSequenceNumber));
+            // Find sequence range
+            int minSeq = Integer.MAX_VALUE;
+            int maxSeq = Integer.MIN_VALUE;
+            for (int seq : receivedPackets.keySet()) {
+                minSeq = Math.min(minSeq, seq);
+                maxSeq = Math.max(maxSeq, seq);
+            }
 
-            // Bước 2: Kiểm tra packets thiếu
-            checkMissingPackets();
+            System.out.println("📊 [CLIENT] Sequence range: " + minSeq + " to " + maxSeq);
 
-            // Bước 3: Ghi vào file
+            // Check for missing packets
+            List<Integer> missingSequences = new ArrayList<>();
+            for (int seq = minSeq; seq <= maxSeq; seq++) {
+                if (!receivedPackets.containsKey(seq)) {
+                    missingSequences.add(seq);
+                }
+            }
+
+            if (!missingSequences.isEmpty()) {
+                System.out.println("⚠️ [CLIENT] Missing " + missingSequences.size() + " packets");
+                if (missingSequences.size() <= 20) {
+                    System.out.println("   Missing sequences: " + missingSequences);
+                }
+            }
+
+            // Write to file
             System.out.println("💾 [CLIENT] Writing to file: " + outputPath);
 
-            try (FileOutputStream fos = new FileOutputStream(outputPath)) {
+            try (FileOutputStream fos = new FileOutputStream(outputPath);
+                 BufferedOutputStream bos = new BufferedOutputStream(fos, 1024 * 1024)) { // 1MB buffer
+
                 long totalBytesWritten = 0;
                 int packetsWritten = 0;
 
-                for (VideoPacket packet : receivedPackets) {
-                    // Chỉ ghi DATA packets
-                    if (packet.getCommand() == Constants.CMD_DATA &&
+                // Write packets in sequence order
+                for (int seq = minSeq; seq <= maxSeq; seq++) {
+                    VideoPacket packet = receivedPackets.get(seq);
+
+                    if (packet != null &&
+                            packet.getCommand() == Constants.CMD_DATA &&
                             packet.getData() != null &&
                             packet.getDataLength() > 0) {
 
-                        fos.write(packet.getData(), 0, packet.getDataLength());
+                        bos.write(packet.getData(), 0, packet.getDataLength());
                         totalBytesWritten += packet.getDataLength();
                         packetsWritten++;
 
-                        // Progress mỗi 100 packets
+                        // Progress every 100 packets
                         if (packetsWritten % 100 == 0) {
-                            System.out.println("  Written: " + packetsWritten + " packets, " +
-                                    (totalBytesWritten / 1024) + " KB");
+                            System.out.println("   Written: " + packetsWritten + " packets, " +
+                                    formatFileSize(totalBytesWritten));
                         }
                     }
                 }
 
-                fos.flush();
+                bos.flush();
 
                 System.out.println("✅ [CLIENT] Video saved successfully!");
-                System.out.println("📊 [CLIENT] Statistics:");
-                System.out.println("   - Packets written: " + packetsWritten);
-                System.out.println("   - Total bytes: " + totalBytesWritten +
-                        " (" + (totalBytesWritten / 1024 / 1024.0) + " MB)");
-                System.out.println("   - File: " + outputPath);
+                System.out.println("📊 [CLIENT] Save statistics:");
+                System.out.println("   Packets written: " + packetsWritten);
+                System.out.println("   Total size: " + formatFileSize(totalBytesWritten));
+                System.out.println("   Missing packets: " + missingSequences.size());
+                System.out.println("   File: " + outputPath);
 
                 // Verify file
                 File savedFile = new File(outputPath);
-                if (savedFile.exists()) {
-                    System.out.println("✅ [CLIENT] File exists, size: " +
-                            savedFile.length() + " bytes");
+                if (savedFile.exists() && savedFile.length() > 0) {
+                    System.out.println("✅ [CLIENT] File verified: " + formatFileSize(savedFile.length()));
+
+                    // Check if file size is reasonable
+                    if (savedFile.length() < 1000) {
+                        System.err.println("⚠️ [CLIENT] Warning: File size is very small!");
+                    }
                 } else {
-                    System.err.println("❌ [CLIENT] File was not created!");
+                    System.err.println("❌ [CLIENT] File verification failed!");
                 }
 
                 dbManager.logEvent("SAVE", clientIp,
-                        "Video saved: " + outputPath + " (" + totalBytesWritten + " bytes)");
+                        String.format("Video saved: %s (%.2f MB, %d packets)",
+                                outputPath, totalBytesWritten / (1024.0 * 1024.0), packetsWritten));
 
             }
 
         } catch (IOException e) {
             System.err.println("❌ [CLIENT] Failed to save video: " + e.getMessage());
             e.printStackTrace();
-        }
-    }
-    private void checkMissingPackets() {
-        if (receivedPackets.isEmpty()) return;
-
-        List<Integer> missingSeq = new ArrayList<>();
-        int firstSeq = receivedPackets.get(0).getSequenceNumber();
-        int lastSeq = receivedPackets.get(receivedPackets.size() - 1).getSequenceNumber();
-
-        int receivedIndex = 0;
-        for (int expectedSeq = firstSeq; expectedSeq <= lastSeq; expectedSeq++) {
-            if (receivedIndex < receivedPackets.size() &&
-                    receivedPackets.get(receivedIndex).getSequenceNumber() == expectedSeq) {
-                receivedIndex++;
-            } else {
-                missingSeq.add(expectedSeq);
+            if (callback != null) {
+                callback.onError("Failed to save video: " + e.getMessage());
             }
-        }
-
-        if (!missingSeq.isEmpty()) {
-            System.out.println("⚠️ [CLIENT] Missing packets: " + missingSeq.size() +
-                    " out of " + (lastSeq - firstSeq + 1));
-            System.out.println("    Sequence range: " + firstSeq + " to " + lastSeq);
-            if (missingSeq.size() <= 10) {
-                System.out.println("    Missing: " + missingSeq);
-            }
-        } else {
-            System.out.println("✅ [CLIENT] All packets received in sequence!");
         }
     }
 
-    // ===== Getters =====
+    /** Format file size */
+    private String formatFileSize(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024 * 1024) return String.format("%.2f KB", bytes / 1024.0);
+        if (bytes < 1024 * 1024 * 1024) return String.format("%.2f MB", bytes / (1024.0 * 1024.0));
+        return String.format("%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+
+    // Getters
     public List<VideoPacket> getReceivedPackets() {
-        return new ArrayList<>(receivedPackets);
+        return new ArrayList<>(receivedPackets.values());
     }
 
     public int getPacketsReceived() { return packetsReceived; }
     public int getDroppedPackets() { return droppedPackets; }
     public String getClientIp() { return clientIp; }
+    public boolean isPaused() { return false; }
 
-    // ===== Auto-reconnect control =====
+    // Auto-reconnect control
     public void setAutoReconnect(boolean enabled) {
         this.autoReconnect = enabled;
     }
