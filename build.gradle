@@ -30,6 +30,16 @@ dependencies {
 
     // Chart library
     implementation 'org.jfree:jfreechart:1.5.4'
+
+    // ===== NEW: Webcam & Media Libraries =====
+    // Webcam Capture Library
+    implementation 'com.github.sarxos:webcam-capture:0.3.12'
+
+    // Video encoding (optional - for better compression)
+    implementation 'org.bytedeco:javacv-platform:1.5.9'
+
+    // Image processing
+    implementation 'com.twelvemonkeys.imageio:imageio-jpeg:3.9.4'
 }
 
 test {

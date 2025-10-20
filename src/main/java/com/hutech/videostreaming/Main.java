@@ -2,6 +2,7 @@ package com.hutech.videostreaming;
 
 import com.hutech.videostreaming.gui.ClientGUI;
 import com.hutech.videostreaming.gui.ServerGUI;
+import com.hutech.videostreaming.gui.LiveStreamGUI;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.geometry.Insets;
@@ -21,13 +22,13 @@ import javafx.util.Duration;
 
 /**
  * Main Launcher Application
- * Cho phép người dùng chọn chạy Server hoặc Client
+ * Cho phép người dùng chọn chạy Server, Client hoặc Live Streaming
  */
 public class Main extends Application {
 
     @Override
     public void start(Stage primaryStage) {
-        VBox root = new VBox(30);
+        VBox root = new VBox(25);
         root.setAlignment(Pos.CENTER);
         root.setPadding(new Insets(50));
         root.setStyle("-fx-background-color: linear-gradient(to bottom right, #667eea, #764ba2);");
@@ -52,9 +53,9 @@ public class Main extends Application {
         // ===== Divider =====
         VBox divider = new VBox(5);
         divider.setAlignment(Pos.CENTER);
-        divider.setMaxWidth(400);
+        divider.setMaxWidth(450);
 
-        Label dividerLine = new Label("━━━━━━━━━━━━━━━━━━━━━━");
+        Label dividerLine = new Label("━━━━━━━━━━━━━━━━━━━━━━━━━━");
         dividerLine.setFont(Font.font("Segoe UI", FontWeight.NORMAL, 16));
         dividerLine.setTextFill(Color.web("#e0e0e0", 0.5));
 
@@ -66,7 +67,7 @@ public class Main extends Application {
 
         // ===== Server Button =====
         Button serverBtn = createLauncherButton("🎬 Launch Server", "#10b981",
-                "Start streaming video to multiple clients");
+                "Stream video files to multiple clients");
         serverBtn.setOnAction(e -> {
             launchServer();
             primaryStage.close();
@@ -80,6 +81,14 @@ public class Main extends Application {
             primaryStage.close();
         });
 
+        // ===== NEW: Live Streaming Button =====
+        Button liveBtn = createLauncherButton("📹 Live Streaming", "#8b5cf6",
+                "Broadcast webcam or screen capture");
+        liveBtn.setOnAction(e -> {
+            launchLiveStream();
+            primaryStage.close();
+        });
+
         // ===== Exit Button =====
         Button exitBtn = createLauncherButton("❌ Exit", "#ef4444",
                 "Close the application");
@@ -89,7 +98,7 @@ public class Main extends Application {
         });
 
         // ===== Info Label =====
-        Label infoLabel = new Label("Version 1.0 | Created by [Your Name]");
+        Label infoLabel = new Label("Version 2.0 | Enhanced with Live Streaming");
         infoLabel.setFont(Font.font("Segoe UI", FontWeight.NORMAL, 10));
         infoLabel.setTextFill(Color.web("#e0e0e0", 0.7));
         infoLabel.setTextAlignment(TextAlignment.CENTER);
@@ -102,6 +111,7 @@ public class Main extends Application {
                 divider,
                 serverBtn,
                 clientBtn,
+                liveBtn,
                 exitBtn,
                 infoLabel
         );
@@ -110,7 +120,7 @@ public class Main extends Application {
         applyFadeInAnimation(root);
 
         // Scene setup
-        Scene scene = new Scene(root, 650, 700);
+        Scene scene = new Scene(root, 650, 750);
         scene.setFill(Color.TRANSPARENT);
 
         primaryStage.setTitle("Multicast Video Streaming - Launcher");
@@ -233,6 +243,28 @@ public class Main extends Application {
                     } catch (Exception e) {
                         e.printStackTrace();
                         showError("Failed to launch Client: " + e.getMessage());
+                    }
+                });
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }).start();
+    }
+
+    /**
+     * NEW: Khởi chạy Live Streaming GUI
+     */
+    private void launchLiveStream() {
+        new Thread(() -> {
+            try {
+                Platform.runLater(() -> {
+                    try {
+                        Stage liveStage = new Stage();
+                        LiveStreamGUI liveGUI = new LiveStreamGUI();
+                        liveGUI.start(liveStage);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                        showError("Failed to launch Live Streaming: " + e.getMessage());
                     }
                 });
             } catch (Exception e) {
