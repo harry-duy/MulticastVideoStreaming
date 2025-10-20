@@ -1,17 +1,16 @@
 package com.hutech.videostreaming.server;
 
 import com.hutech.videostreaming.common.*;
-import com.hutech.videostreaming.live.LiveStreamManager;
 import java.io.*;
 import java.net.*;
 import java.util.*;
 import java.util.concurrent.*;
 
 /**
- * Live Video Server
+ * Live Video Server - FIXED VERSION
  * Streams live content from webcam or screen capture
  */
-public class LiveVideoServer implements LiveStreamManager.StreamDataCallback {
+public class LiveVideoServer {
 
     private MulticastSocket socket;
     private InetAddress group;
@@ -31,7 +30,7 @@ public class LiveVideoServer implements LiveStreamManager.StreamDataCallback {
 
     // Settings
     private static final int MAX_PACKET_SIZE = 60000;
-    private static final int QUEUE_SIZE = 100; // Buffer up to 100 frames
+    private static final int QUEUE_SIZE = 100;
 
     public LiveVideoServer() {
         this.dbManager = new DatabaseManager();
@@ -51,7 +50,6 @@ public class LiveVideoServer implements LiveStreamManager.StreamDataCallback {
 
             group = InetAddress.getByName(Constants.MULTICAST_ADDRESS);
 
-            // Select network interface
             NetworkInterface networkInterface = findMulticastInterface();
             if (networkInterface != null) {
                 socket.setNetworkInterface(networkInterface);
@@ -61,7 +59,6 @@ public class LiveVideoServer implements LiveStreamManager.StreamDataCallback {
 
             socket.setTimeToLive(1);
 
-            // Increase send buffer
             try {
                 socket.setSendBufferSize(8 * 1024 * 1024);
                 System.out.println("🧪 [LIVE-SERVER] Send buffer: " +
@@ -70,7 +67,7 @@ public class LiveVideoServer implements LiveStreamManager.StreamDataCallback {
                 System.out.println("⚠️ [LIVE-SERVER] Could not set send buffer");
             }
 
-            System.out.println("✅ [LIVE-SERVER] Initialized");
+            System.out.println("✅ [LIVE-SERVER] Initialized successfully");
             System.out.println("📡 Address: " + Constants.MULTICAST_ADDRESS);
             System.out.println("🔌 Port: " + Constants.MULTICAST_PORT);
 
@@ -78,19 +75,23 @@ public class LiveVideoServer implements LiveStreamManager.StreamDataCallback {
 
         } catch (IOException e) {
             System.err.println("❌ [LIVE-SERVER] Init failed: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
     /**
-     * Start streaming from LiveStreamManager
+     * ✅ NEW: Start broadcasting (called from GUI)
      */
-    public void startStreaming(LiveStreamManager liveManager) {
+    public void startBroadcasting() {
         if (isStreaming) {
             System.out.println("⚠️ [LIVE-SERVER] Already streaming");
             return;
         }
 
-        initialize();
+        if (socket == null) {
+            System.out.println("🔧 [LIVE-SERVER] Socket not initialized, initializing now...");
+            initialize();
+        }
 
         isStreaming = true;
         sequenceNumber = 0;
@@ -99,51 +100,74 @@ public class LiveVideoServer implements LiveStreamManager.StreamDataCallback {
         droppedFrames = 0;
         bandwidthMonitor.reset();
 
-        System.out.println("▶️ [LIVE-SERVER] Starting live stream...");
+        System.out.println("▶️ [LIVE-SERVER] Starting live broadcast...");
 
-        // Send START command
-        sendControlCommand(Constants.CMD_START);
+        // Send START command multiple times for reliability
+        for (int i = 0; i < 3; i++) {
+            sendControlCommand(Constants.CMD_START);
+            try { Thread.sleep(100); } catch (InterruptedException ignored) {}
+        }
 
         // Start frame sender thread
         sendExecutor.submit(() -> {
-            System.out.println("📤 [LIVE-SERVER] Frame sender started");
+            System.out.println("📤 [LIVE-SERVER] Frame sender thread started");
 
             while (isStreaming) {
                 try {
-                    // Get frame from queue (blocking)
                     byte[] frameData = frameQueue.poll(1, TimeUnit.SECONDS);
 
                     if (frameData != null) {
-                        sendFrame(frameData);
+                        sendFrameData(frameData);
                     }
 
                 } catch (InterruptedException e) {
+                    System.out.println("⚠️ [LIVE-SERVER] Frame sender interrupted");
                     break;
                 } catch (Exception e) {
                     System.err.println("❌ [LIVE-SERVER] Send error: " + e.getMessage());
+                    e.printStackTrace();
                 }
             }
 
-            System.out.println("🛑 [LIVE-SERVER] Frame sender stopped");
+            System.out.println("🛑 [LIVE-SERVER] Frame sender thread stopped");
         });
 
         dbManager.logEvent("START", "LIVE-SERVER", "Live streaming started");
+        System.out.println("✅ [LIVE-SERVER] Broadcasting started successfully");
     }
 
     /**
-     * Send single frame
+     * ✅ NEW: Receive frame from GUI (called by LiveStreamGUI)
      */
-    private void sendFrame(byte[] frameData) throws IOException {
+    public void sendFrame(byte[] frameData, long timestamp) {
+        if (!isStreaming) {
+            return;
+        }
+
+        // Try to add to queue
+        boolean added = frameQueue.offer(frameData);
+
+        if (!added) {
+            droppedFrames++;
+            if (droppedFrames % 10 == 0) {
+                System.err.println("⚠️ [LIVE-SERVER] Queue full! Dropped " +
+                        droppedFrames + " frames (Queue size: " + frameQueue.size() + ")");
+            }
+        }
+    }
+
+    /**
+     * Internal method to send frame data
+     */
+    private void sendFrameData(byte[] frameData) throws IOException {
         int offset = 0;
         int framePackets = 0;
 
-        // Split frame into packets if needed
         while (offset < frameData.length) {
             int chunkSize = Math.min(MAX_PACKET_SIZE, frameData.length - offset);
             byte[] chunk = new byte[chunkSize];
             System.arraycopy(frameData, offset, chunk, 0, chunkSize);
 
-            // Create and send packet
             VideoPacket packet = new VideoPacket(
                     Constants.CMD_DATA,
                     sequenceNumber++,
@@ -168,12 +192,12 @@ public class LiveVideoServer implements LiveStreamManager.StreamDataCallback {
 
         framesSent++;
 
-        // Log progress
+        // Log progress every 100 frames
         if (framesSent % 100 == 0) {
             System.out.println(String.format(
-                    "📊 [LIVE-SERVER] Frames: %d | Packets: %d | Bandwidth: %s | Dropped: %d",
+                    "📊 [LIVE-SERVER] Frames: %d | Packets: %d | BW: %s | Dropped: %d | Queue: %d",
                     framesSent, sequenceNumber,
-                    bandwidthMonitor.getFormattedBandwidth(), droppedFrames
+                    bandwidthMonitor.getFormattedBandwidth(), droppedFrames, frameQueue.size()
             ));
         }
     }
@@ -192,7 +216,9 @@ public class LiveVideoServer implements LiveStreamManager.StreamDataCallback {
 
             socket.send(dgPacket);
 
-            System.out.println("📨 [LIVE-SERVER] Sent control command: " + command);
+            String cmdName = command == Constants.CMD_START ? "START" :
+                    command == Constants.CMD_STOP ? "STOP" : "UNKNOWN";
+            System.out.println("📨 [LIVE-SERVER] Sent command: " + cmdName);
 
         } catch (IOException e) {
             System.err.println("❌ [LIVE-SERVER] Failed to send command: " + e.getMessage());
@@ -205,10 +231,15 @@ public class LiveVideoServer implements LiveStreamManager.StreamDataCallback {
     public void stopStreaming() {
         if (!isStreaming) return;
 
+        System.out.println("⏹️ [LIVE-SERVER] Stopping broadcast...");
+
         isStreaming = false;
 
-        // Send STOP command
-        sendControlCommand(Constants.CMD_STOP);
+        // Send STOP command multiple times
+        for (int i = 0; i < 3; i++) {
+            sendControlCommand(Constants.CMD_STOP);
+            try { Thread.sleep(100); } catch (InterruptedException ignored) {}
+        }
 
         // Clear queue
         frameQueue.clear();
@@ -234,6 +265,13 @@ public class LiveVideoServer implements LiveStreamManager.StreamDataCallback {
 
         if (sendExecutor != null) {
             sendExecutor.shutdown();
+            try {
+                if (!sendExecutor.awaitTermination(2, TimeUnit.SECONDS)) {
+                    sendExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                sendExecutor.shutdownNow();
+            }
         }
 
         if (socket != null && !socket.isClosed()) {
@@ -247,41 +285,8 @@ public class LiveVideoServer implements LiveStreamManager.StreamDataCallback {
         System.out.println("🔴 [LIVE-SERVER] Closed");
     }
 
-    // ==================== CALLBACKS ====================
-
-    @Override
-    public void onFrameReady(byte[] frameData, long timestamp) {
-        if (!isStreaming) return;
-
-        // Try to add to queue
-        boolean added = frameQueue.offer(frameData);
-
-        if (!added) {
-            // Queue full - drop frame
-            droppedFrames++;
-
-            if (droppedFrames % 10 == 0) {
-                System.err.println("⚠️ [LIVE-SERVER] Queue full! Dropped " +
-                        droppedFrames + " frames");
-            }
-        }
-    }
-
-    @Override
-    public void onError(String error) {
-        System.err.println("❌ [LIVE-SERVER] Stream error: " + error);
-    }
-
-    @Override
-    public void onStatisticsUpdate(LiveStreamManager.StreamStatistics stats) {
-        // Can log or forward stats if needed
-    }
-
     // ==================== UTILITIES ====================
 
-    /**
-     * Find suitable network interface
-     */
     private static NetworkInterface findMulticastInterface() {
         try {
             List<NetworkInterface> candidates = new ArrayList<>();
@@ -293,7 +298,6 @@ public class LiveVideoServer implements LiveStreamManager.StreamDataCallback {
                 if (!nif.isUp() || nif.isLoopback() || nif.isVirtual()) continue;
                 if (!nif.supportsMulticast()) continue;
 
-                // Check for IPv4
                 Enumeration<InetAddress> addrs = nif.getInetAddresses();
                 boolean hasIPv4 = false;
                 while (addrs.hasMoreElements()) {
@@ -309,7 +313,6 @@ public class LiveVideoServer implements LiveStreamManager.StreamDataCallback {
                 }
             }
 
-            // Prefer ethernet/wifi
             for (NetworkInterface nif : candidates) {
                 String name = nif.getName().toLowerCase();
                 if (name.contains("eth") || name.contains("en") ||
@@ -325,9 +328,6 @@ public class LiveVideoServer implements LiveStreamManager.StreamDataCallback {
         }
     }
 
-    /**
-     * Format bytes
-     */
     private String formatBytes(long bytes) {
         if (bytes < 1024) return bytes + " B";
         if (bytes < 1024 * 1024) return String.format("%.2f KB", bytes / 1024.0);
@@ -344,9 +344,6 @@ public class LiveVideoServer implements LiveStreamManager.StreamDataCallback {
     public long getDroppedFrames() { return droppedFrames; }
     public int getQueueSize() { return frameQueue.size(); }
 
-    /**
-     * Get statistics
-     */
     public LiveStreamStatistics getStatistics() {
         LiveStreamStatistics stats = new LiveStreamStatistics();
         stats.isStreaming = isStreaming;
@@ -359,9 +356,6 @@ public class LiveVideoServer implements LiveStreamManager.StreamDataCallback {
         return stats;
     }
 
-    /**
-     * Statistics class
-     */
     public static class LiveStreamStatistics {
         public boolean isStreaming;
         public long framesSent;

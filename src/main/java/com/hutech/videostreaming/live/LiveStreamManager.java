@@ -1,7 +1,6 @@
 package com.hutech.videostreaming.live;
 
-import com.github.sarxos.webcam.Webcam;
-import com.github.sarxos.webcam.WebcamResolution;
+import com.hutech.videostreaming.live.JavaCVWebcamCapture;  // ✅ THÊM
 import javax.imageio.ImageIO;
 import java.awt.*;
 import java.awt.image.BufferedImage;
@@ -10,7 +9,7 @@ import java.util.concurrent.*;
 import java.util.zip.*;
 
 /**
- * Enhanced Live Stream Manager with Real Webcam & Screen Capture
+ * Enhanced Live Stream Manager with JavaCV Webcam
  */
 public class LiveStreamManager {
 
@@ -25,9 +24,10 @@ public class LiveStreamManager {
     private boolean compressionEnabled = true;
     private Rectangle captureRegion = null;
 
-    // Webcam
-    private Webcam webcam;
-    private Dimension webcamResolution = WebcamResolution.VGA.getSize();
+    // ✅ Webcam - Dùng JavaCV thay vì Webcam Capture
+    private JavaCVWebcamCapture javacvCapture;
+    private int webcamWidth = 640;
+    private int webcamHeight = 480;
 
     // Screen capture
     private Robot robot;
@@ -70,10 +70,10 @@ public class LiveStreamManager {
         }
     }
 
-    // ==================== WEBCAM STREAMING ====================
+    // ==================== WEBCAM STREAMING (JAVACV) ====================
 
     /**
-     * Start webcam streaming
+     * Start webcam streaming với JavaCV
      */
     public void startWebcamStream() {
         if (isStreaming) {
@@ -81,30 +81,26 @@ public class LiveStreamManager {
         }
 
         try {
-            // Get default webcam
-            webcam = Webcam.getDefault();
-
-            if (webcam == null) {
-                throw new RuntimeException("No webcam found!");
-            }
-
-            webcam.setViewSize(webcamResolution);
-            webcam.open();
+            // ✅ Khởi tạo JavaCV capture
+            javacvCapture = new JavaCVWebcamCapture();
+            javacvCapture.setResolution(webcamWidth, webcamHeight);
+            javacvCapture.setFrameRate(fps);
+            javacvCapture.start();
 
             isStreaming = true;
             currentSource = StreamSource.WEBCAM;
 
-            System.out.println("📹 [LIVE] Webcam streaming started");
-            System.out.println("   Resolution: " + webcamResolution.width + "x" + webcamResolution.height);
+            System.out.println("📹 [LIVE] Webcam streaming started (JavaCV)");
+            System.out.println("   Resolution: " + webcamWidth + "x" + webcamHeight);
             System.out.println("   FPS: " + fps);
 
             // Start capture loop
             long delay = 1000 / fps;
             captureScheduler.scheduleAtFixedRate(() -> {
-                if (!isStreaming || webcam == null) return;
+                if (!isStreaming || javacvCapture == null) return;
 
                 try {
-                    BufferedImage image = webcam.getImage();
+                    BufferedImage image = javacvCapture.captureFrame();
 
                     if (image != null) {
                         processAndSendFrame(image);
@@ -118,6 +114,7 @@ public class LiveStreamManager {
 
         } catch (Exception e) {
             System.err.println("❌ [LIVE] Failed to start webcam: " + e.getMessage());
+            e.printStackTrace();
             if (dataCallback != null) {
                 dataCallback.onError("Webcam error: " + e.getMessage());
             }
@@ -125,26 +122,18 @@ public class LiveStreamManager {
     }
 
     /**
-     * Change webcam resolution
+     * Set webcam resolution
      */
-    public void setWebcamResolution(Dimension resolution) {
-        this.webcamResolution = resolution;
-
-        if (webcam != null && webcam.isOpen()) {
-            boolean wasStreaming = isStreaming;
-            stopStreaming();
-
-            if (wasStreaming) {
-                startWebcamStream();
-            }
-        }
+    public void setWebcamResolution(int width, int height) {
+        this.webcamWidth = width;
+        this.webcamHeight = height;
     }
 
     /**
-     * List available webcams
+     * ✅ List available webcams (JavaCV)
      */
-    public static java.util.List<Webcam> getAvailableWebcams() {
-        return Webcam.getWebcams();
+    public static java.util.List<JavaCVWebcamCapture.WebcamInfo> getAvailableWebcams() {
+        return JavaCVWebcamCapture.listWebcams();
     }
 
     // ==================== SCREEN CAPTURE ====================
@@ -316,10 +305,14 @@ public class LiveStreamManager {
     public void stopStreaming() {
         isStreaming = false;
 
-        // Stop webcam
-        if (webcam != null && webcam.isOpen()) {
-            webcam.close();
-            webcam = null;
+        // ✅ Stop JavaCV webcam
+        if (javacvCapture != null) {
+            try {
+                javacvCapture.release();
+                javacvCapture = null;
+            } catch (Exception e) {
+                System.err.println("⚠️ [LIVE] Error releasing webcam: " + e.getMessage());
+            }
         }
 
         // Stop scheduler
@@ -343,22 +336,6 @@ public class LiveStreamManager {
     }
 
     /**
-     * Pause streaming
-     */
-    public void pauseStreaming() {
-        isStreaming = false;
-        System.out.println("⏸️ [LIVE] Streaming paused");
-    }
-
-    /**
-     * Resume streaming
-     */
-    public void resumeStreaming() {
-        isStreaming = true;
-        System.out.println("▶️ [LIVE] Streaming resumed");
-    }
-
-    /**
      * Set quality and FPS
      */
     public void setQuality(double quality, int fps) {
@@ -368,24 +345,6 @@ public class LiveStreamManager {
         System.out.println("⚙️ [LIVE] Quality updated:");
         System.out.println("   Quality: " + (this.quality * 100) + "%");
         System.out.println("   FPS: " + this.fps);
-
-        // Restart if streaming
-        if (isStreaming) {
-            StreamSource source = currentSource;
-            Rectangle region = captureRegion;
-            stopStreaming();
-
-            switch (source) {
-                case WEBCAM:
-                    startWebcamStream();
-                    break;
-                case SCREEN:
-                case SCREEN_REGION:
-                    startScreenCapture(region != null ? region :
-                            new Rectangle(Toolkit.getDefaultToolkit().getScreenSize()));
-                    break;
-            }
-        }
     }
 
     /**
@@ -409,7 +368,8 @@ public class LiveStreamManager {
         stats.framesCaptures = framesCaptures;
         stats.bytesTransmitted = bytesTransmitted;
         stats.resolution = captureRegion != null ?
-                captureRegion.width + "x" + captureRegion.height : "N/A";
+                captureRegion.width + "x" + captureRegion.height :
+                webcamWidth + "x" + webcamHeight;
         return stats;
     }
 

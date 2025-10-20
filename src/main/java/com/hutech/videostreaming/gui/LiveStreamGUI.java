@@ -1,7 +1,7 @@
 package com.hutech.videostreaming.gui;
 
-import com.github.sarxos.webcam.Webcam;
 import com.hutech.videostreaming.common.*;
+import com.hutech.videostreaming.live.JavaCVWebcamCapture;  // ✅ THAY ĐỔI
 import com.hutech.videostreaming.live.LiveStreamManager;
 import com.hutech.videostreaming.live.ScreenRegionSelector;
 import com.hutech.videostreaming.server.LiveVideoServer;
@@ -23,6 +23,7 @@ import javax.imageio.ImageIO;
 
 /**
  * Live Streaming GUI - Webcam & Screen Capture
+ * FIXED VERSION - Using JavaCV instead of Webcam Capture
  */
 public class LiveStreamGUI extends Application implements LiveStreamManager.StreamDataCallback {
 
@@ -66,6 +67,7 @@ public class LiveStreamGUI extends Application implements LiveStreamManager.Stre
         // Initialize managers
         liveManager = new LiveStreamManager(this);
         liveServer = new LiveVideoServer();
+        liveServer.initialize();  // ✅ ĐÃ CÓ
 
         // Root layout
         BorderPane root = new BorderPane();
@@ -230,11 +232,11 @@ public class LiveStreamGUI extends Application implements LiveStreamManager.Stre
         fpsTitle.setTextFill(Color.web("#e0e0e0"));
         fpsTitle.setFont(Font.font("Segoe UI", FontWeight.SEMI_BOLD, 13));
 
-        fpsLabel = new Label("25");
-        fpsLabel.setTextFill(Color.web("#60a5fa"));
-        fpsLabel.setFont(Font.font("Segoe UI", FontWeight.BOLD, 13));
+        Label fpsValueLabel = new Label("25");
+        fpsValueLabel.setTextFill(Color.web("#60a5fa"));
+        fpsValueLabel.setFont(Font.font("Segoe UI", FontWeight.BOLD, 13));
 
-        fpsHeader.getChildren().addAll(fpsTitle, fpsLabel);
+        fpsHeader.getChildren().addAll(fpsTitle, fpsValueLabel);
 
         fpsSlider = new Slider(5, 60, 25);
         fpsSlider.setShowTickMarks(true);
@@ -242,7 +244,7 @@ public class LiveStreamGUI extends Application implements LiveStreamManager.Stre
         fpsSlider.setMajorTickUnit(10);
         fpsSlider.setMinorTickCount(4);
         fpsSlider.valueProperty().addListener((obs, oldVal, newVal) -> {
-            fpsLabel.setText(String.valueOf(newVal.intValue()));
+            fpsValueLabel.setText(String.valueOf(newVal.intValue()));
         });
 
         fpsBox.getChildren().addAll(fpsHeader, fpsSlider);
@@ -481,6 +483,47 @@ public class LiveStreamGUI extends Application implements LiveStreamManager.Stre
         double quality = qualitySlider.getValue() / 100.0;
         boolean compression = compressionCheckbox.isSelected();
 
+        // ✅ Kiểm tra webcam với JavaCV
+        if (source.contains("Webcam")) {
+            log("🔍 Detecting webcams with JavaCV...");
+
+            try {
+                java.util.List<JavaCVWebcamCapture.WebcamInfo> webcams =
+                        JavaCVWebcamCapture.listWebcams();
+
+                if (webcams.isEmpty()) {
+                    NotificationManager.error("No webcam found! Please connect a webcam.", primaryStage);
+                    log("❌ No webcam detected");
+                    return;
+                }
+
+                log("✅ Found " + webcams.size() + " webcam(s):");
+                for (JavaCVWebcamCapture.WebcamInfo cam : webcams) {
+                    log("   - " + cam.toString());
+                }
+
+                // ✅ Set resolution từ dropdown
+                String resString = resolutionSelector.getValue();
+                int width = 640, height = 480;
+
+                if (resString.contains("800x600")) {
+                    width = 800; height = 600;
+                } else if (resString.contains("1280x720")) {
+                    width = 1280; height = 720;
+                } else if (resString.contains("1920x1080")) {
+                    width = 1920; height = 1080;
+                }
+
+                liveManager.setWebcamResolution(width, height);
+                log("📐 Resolution set to: " + width + "x" + height);
+
+            } catch (Exception e) {
+                log("❌ Webcam detection failed: " + e.getMessage());
+                NotificationManager.error("Failed to detect webcam: " + e.getMessage(), primaryStage);
+                return;
+            }
+        }
+
         // Apply settings
         liveManager.setQuality(quality, fps);
         liveManager.setCompression(compression);
@@ -496,15 +539,16 @@ public class LiveStreamGUI extends Application implements LiveStreamManager.Stre
             } else if (source.contains("Region")) {
                 if (selectedRegion != null) {
                     liveManager.startScreenCapture(selectedRegion);
-                    log("✂️ Started screen region capture");
+                    log("✂️ Started screen region capture: " +
+                            selectedRegion.width + "x" + selectedRegion.height);
                 } else {
                     NotificationManager.warning("Please select a screen region first!", primaryStage);
                     return;
                 }
             }
 
-            // Start server
-            liveServer.startStreaming(liveManager);
+            // ✅ Start server broadcasting
+            liveServer.startBroadcasting();
 
             // Update UI
             statusLabel.setText("🔴 Streaming");
@@ -512,16 +556,21 @@ public class LiveStreamGUI extends Application implements LiveStreamManager.Stre
             startBtn.setDisable(true);
             stopBtn.setDisable(false);
             sourceSelector.setDisable(true);
+            resolutionSelector.setDisable(true);
 
+            log("✅ Live streaming started successfully");
             NotificationManager.success("Live streaming started!", primaryStage);
 
         } catch (Exception e) {
             log("❌ Failed to start: " + e.getMessage());
+            e.printStackTrace();
             NotificationManager.error("Failed to start streaming: " + e.getMessage(), primaryStage);
         }
     }
 
     private void stopLiveStream() {
+        log("⏹️ Stopping live stream...");
+
         liveManager.stopStreaming();
         liveServer.stopStreaming();
 
@@ -530,8 +579,11 @@ public class LiveStreamGUI extends Application implements LiveStreamManager.Stre
         startBtn.setDisable(false);
         stopBtn.setDisable(true);
         sourceSelector.setDisable(false);
+        resolutionSelector.setDisable(false);
 
         log("⏹️ Streaming stopped");
+        log("📊 Final stats - Frames captured: " + frameCount + ", Total data: " + formatBytes(totalBytes));
+
         NotificationManager.info("Streaming stopped", primaryStage);
     }
 
@@ -557,7 +609,12 @@ public class LiveStreamGUI extends Application implements LiveStreamManager.Stre
         frameCount++;
         totalBytes += frameData.length;
 
-        // Update preview if enabled
+        // ✅ GỬI frame đến server để broadcast
+        if (liveServer != null && liveServer.isStreaming()) {
+            liveServer.sendFrame(frameData, timestamp);
+        }
+
+        // Update preview if enabled (every 10 frames to avoid UI lag)
         if (autoPreviewCheckbox.isSelected() && frameCount % 10 == 0) {
             Platform.runLater(() -> updatePreview(frameData));
         }
@@ -576,7 +633,7 @@ public class LiveStreamGUI extends Application implements LiveStreamManager.Stre
         Platform.runLater(() -> {
             fpsLabel.setText(String.format("%.1f", stats.actualFPS));
 
-            double dataRate = (totalBytes / 1024.0) / (stats.framesCaptures / stats.actualFPS);
+            double dataRate = (totalBytes / 1024.0) / (stats.framesCaptures / Math.max(1, stats.actualFPS));
             dataRateLabel.setText(String.format("%.1f KB/s", dataRate));
 
             framesLabel.setText(String.valueOf(stats.framesCaptures));
@@ -595,6 +652,12 @@ public class LiveStreamGUI extends Application implements LiveStreamManager.Stre
         } catch (Exception e) {
             log("⚠️ Preview update failed: " + e.getMessage());
         }
+    }
+
+    private String formatBytes(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024 * 1024) return String.format("%.2f KB", bytes / 1024.0);
+        return String.format("%.2f MB", bytes / (1024.0 * 1024.0));
     }
 
     private Image createPlaceholderImage() {

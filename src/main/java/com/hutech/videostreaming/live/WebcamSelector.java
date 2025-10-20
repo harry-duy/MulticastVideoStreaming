@@ -1,7 +1,5 @@
 package com.hutech.videostreaming.live;
 
-import com.github.sarxos.webcam.Webcam;
-import com.github.sarxos.webcam.WebcamResolution;
 import javafx.application.Platform;
 import javafx.embed.swing.SwingFXUtils;
 import javafx.geometry.*;
@@ -12,22 +10,23 @@ import javafx.scene.layout.*;
 import javafx.scene.paint.Color;
 import javafx.scene.text.*;
 import javafx.stage.*;
-import java.awt.Dimension;
-import java.awt.image.BufferedImage;
 import java.util.*;
 import java.util.concurrent.*;
 
 /**
- * Webcam Selector
+ * Webcam Selector - JavaCV Version
  * Allows user to select from available webcams with preview
  */
 public class WebcamSelector {
 
-    private Webcam selectedWebcam;
-    private Dimension selectedResolution;
+    private JavaCVWebcamCapture selectedCapture;
+    private JavaCVWebcamCapture.WebcamInfo selectedWebcam;
+    private int selectedWidth = 640;
+    private int selectedHeight = 480;
     private CountDownLatch latch;
     private Stage stage;
     private ScheduledExecutorService previewExecutor;
+    private volatile boolean isPreviewRunning = false;
 
     /**
      * Show selector and wait for user selection
@@ -50,8 +49,8 @@ public class WebcamSelector {
             e.printStackTrace();
         }
 
-        if (selectedWebcam != null && selectedResolution != null) {
-            return new WebcamSelection(selectedWebcam, selectedResolution);
+        if (selectedWebcam != null) {
+            return new WebcamSelection(selectedWebcam, selectedWidth, selectedHeight);
         }
 
         return null;
@@ -98,7 +97,7 @@ public class WebcamSelector {
         title.setFont(Font.font("Segoe UI", FontWeight.BOLD, 24));
         title.setTextFill(Color.WHITE);
 
-        Label subtitle = new Label("Choose your webcam and resolution");
+        Label subtitle = new Label("Choose your webcam and resolution (JavaCV)");
         subtitle.setFont(Font.font("Segoe UI", FontWeight.NORMAL, 13));
         subtitle.setTextFill(Color.web("#e0e0e0"));
 
@@ -112,7 +111,7 @@ public class WebcamSelector {
 
         // Left - Webcam list
         VBox leftPanel = createWebcamList();
-        leftPanel.setPrefWidth(300);
+        leftPanel.setPrefWidth(350);
 
         // Right - Preview
         VBox rightPanel = createPreviewPanel();
@@ -135,27 +134,40 @@ public class WebcamSelector {
         title.setTextFill(Color.web("#e0e0e0"));
 
         // Get webcams
-        List<Webcam> webcams = Webcam.getWebcams();
+        List<JavaCVWebcamCapture.WebcamInfo> webcams = JavaCVWebcamCapture.listWebcams();
 
         if (webcams.isEmpty()) {
             Label noWebcam = new Label("❌ No webcams found");
             noWebcam.setTextFill(Color.web("#ef4444"));
             noWebcam.setFont(Font.font("Segoe UI", FontWeight.NORMAL, 14));
-            panel.getChildren().addAll(title, noWebcam);
+
+            Label troubleshoot = new Label("\nTroubleshooting:\n" +
+                    "• Check webcam connection\n" +
+                    "• Close other apps using webcam\n" +
+                    "• Check system permissions");
+            troubleshoot.setTextFill(Color.web("#9ca3af"));
+            troubleshoot.setFont(Font.font("Segoe UI", FontWeight.NORMAL, 11));
+
+            panel.getChildren().addAll(title, noWebcam, troubleshoot);
             return panel;
         }
 
         // Webcam list
         ListView<WebcamItem> webcamListView = new ListView<>();
-        webcamListView.setPrefHeight(200);
+        webcamListView.setPrefHeight(150);
         webcamListView.setStyle(
                 "-fx-background-color: #2a2a3a;" +
                         "-fx-control-inner-background: #2a2a3a;"
         );
 
         // Add webcams
-        for (Webcam webcam : webcams) {
+        for (JavaCVWebcamCapture.WebcamInfo webcam : webcams) {
             webcamListView.getItems().add(new WebcamItem(webcam));
+        }
+
+        // Select first by default
+        if (!webcamListView.getItems().isEmpty()) {
+            webcamListView.getSelectionModel().select(0);
         }
 
         // Resolution selector
@@ -166,29 +178,39 @@ public class WebcamSelector {
         ComboBox<ResolutionItem> resolutionCombo = new ComboBox<>();
         resolutionCombo.setMaxWidth(Double.MAX_VALUE);
         resolutionCombo.getItems().addAll(
-                new ResolutionItem("VGA (640x480)", WebcamResolution.VGA.getSize()),
-                new ResolutionItem("SVGA (800x600)", WebcamResolution.SVGA.getSize()),
-                new ResolutionItem("HD (1280x720)", WebcamResolution.HD.getSize()),
-                new ResolutionItem("Full HD (1920x1080)", new Dimension(1920, 1080))
+                new ResolutionItem("VGA (640x480)", 640, 480),
+                new ResolutionItem("SVGA (800x600)", 800, 600),
+                new ResolutionItem("HD (1280x720)", 1280, 720),
+                new ResolutionItem("Full HD (1920x1080)", 1920, 1080)
         );
         resolutionCombo.setValue(resolutionCombo.getItems().get(0));
 
         // Preview button
-        Button previewBtn = new Button("👁️ Preview");
+        Button previewBtn = new Button("👁️ Start Preview");
         previewBtn.setFont(Font.font("Segoe UI", FontWeight.SEMI_BOLD, 13));
         previewBtn.setMaxWidth(Double.MAX_VALUE);
+        previewBtn.setPrefHeight(45);
         previewBtn.setStyle(
                 "-fx-background-color: #3b82f6;" +
                         "-fx-text-fill: white;" +
                         "-fx-background-radius: 6;"
         );
 
+        // Store references for later
+        previewBtn.setUserData(new PreviewData(webcamListView, resolutionCombo));
+
         previewBtn.setOnAction(e -> {
             WebcamItem selected = webcamListView.getSelectionModel().getSelectedItem();
             ResolutionItem resolution = resolutionCombo.getValue();
 
             if (selected != null && resolution != null) {
-                startPreview(selected.webcam, resolution.dimension);
+                selectedWebcam = selected.webcamInfo;
+                selectedWidth = resolution.width;
+                selectedHeight = resolution.height;
+                startPreview(selectedWebcam.id, resolution.width, resolution.height);
+
+                previewBtn.setText("⏹️ Stop Preview");
+                previewBtn.setStyle("-fx-background-color: #ef4444; -fx-text-fill: white;");
             }
         });
 
@@ -197,18 +219,6 @@ public class WebcamSelector {
                 resolutionTitle, resolutionCombo,
                 previewBtn
         );
-
-        // Store selections when user clicks preview
-        previewBtn.setOnAction(e -> {
-            WebcamItem selected = webcamListView.getSelectionModel().getSelectedItem();
-            ResolutionItem resolution = resolutionCombo.getValue();
-
-            if (selected != null && resolution != null) {
-                selectedWebcam = selected.webcam;
-                selectedResolution = resolution.dimension;
-                startPreview(selectedWebcam, selectedResolution);
-            }
-        });
 
         return panel;
     }
@@ -242,7 +252,7 @@ public class WebcamSelector {
         previewImageView.fitWidthProperty().bind(previewPane.widthProperty().subtract(20));
         previewImageView.fitHeightProperty().bind(previewPane.heightProperty().subtract(20));
 
-        Label placeholderLabel = new Label("📹\nSelect a webcam and click Preview");
+        Label placeholderLabel = new Label("📹\n\nSelect a webcam and click\n'Start Preview'");
         placeholderLabel.setFont(Font.font("Segoe UI", FontWeight.NORMAL, 16));
         placeholderLabel.setTextFill(Color.web("#6b7280"));
         placeholderLabel.setTextAlignment(TextAlignment.CENTER);
@@ -250,14 +260,14 @@ public class WebcamSelector {
         previewPane.getChildren().addAll(placeholderLabel, previewImageView);
 
         // Info label
-        Label infoLabel = new Label("Preview will update automatically");
+        Label infoLabel = new Label("Preview updates at 10 FPS to reduce CPU usage");
         infoLabel.setFont(Font.font("Segoe UI", FontWeight.NORMAL, 11));
         infoLabel.setTextFill(Color.web("#9ca3af"));
 
         panel.getChildren().addAll(title, previewPane, infoLabel);
 
         // Store reference for preview updates
-        panel.setUserData(new PreviewData(previewImageView, placeholderLabel));
+        panel.setUserData(new PreviewPanelData(previewImageView, placeholderLabel));
 
         return panel;
     }
@@ -269,29 +279,16 @@ public class WebcamSelector {
         bottom.setStyle("-fx-background-color: #262637;");
 
         Button cancelBtn = new Button("Cancel");
-        cancelBtn.setFont(Font.font("Segoe UI", FontWeight.SEMI_BOLD, 13));
-        cancelBtn.setPrefWidth(120);
-        cancelBtn.setStyle(
-                "-fx-background-color: #6b7280;" +
-                        "-fx-text-fill: white;" +
-                        "-fx-background-radius: 6;"
-        );
+        styleButton(cancelBtn, "#6b7280");
         cancelBtn.setOnAction(e -> {
             cleanup();
             selectedWebcam = null;
-            selectedResolution = null;
             stage.close();
             latch.countDown();
         });
 
-        Button selectBtn = new Button("Select");
-        selectBtn.setFont(Font.font("Segoe UI", FontWeight.SEMI_BOLD, 13));
-        selectBtn.setPrefWidth(120);
-        selectBtn.setStyle(
-                "-fx-background-color: #10b981;" +
-                        "-fx-text-fill: white;" +
-                        "-fx-background-radius: 6;"
-        );
+        Button selectBtn = new Button("✓ Select");
+        styleButton(selectBtn, "#10b981");
         selectBtn.setOnAction(e -> {
             cleanup();
             stage.close();
@@ -302,24 +299,61 @@ public class WebcamSelector {
         return bottom;
     }
 
+    private void styleButton(Button button, String color) {
+        button.setFont(Font.font("Segoe UI", FontWeight.SEMI_BOLD, 13));
+        button.setPrefWidth(120);
+        button.setPrefHeight(40);
+        button.setStyle(
+                "-fx-background-color: " + color + ";" +
+                        "-fx-text-fill: white;" +
+                        "-fx-background-radius: 6;"
+        );
+
+        button.setOnMouseEntered(e -> {
+            if (!button.isDisabled()) {
+                button.setStyle(
+                        "-fx-background-color: derive(" + color + ", -10%);" +
+                                "-fx-text-fill: white;" +
+                                "-fx-background-radius: 6;"
+                );
+            }
+        });
+
+        button.setOnMouseExited(e -> {
+            if (!button.isDisabled()) {
+                button.setStyle(
+                        "-fx-background-color: " + color + ";" +
+                                "-fx-text-fill: white;" +
+                                "-fx-background-radius: 6;"
+                );
+            }
+        });
+    }
+
     /**
      * Start webcam preview
      */
-    private void startPreview(Webcam webcam, Dimension resolution) {
+    private void startPreview(int deviceId, int width, int height) {
         // Stop previous preview
         stopPreview();
 
         try {
-            webcam.setViewSize(resolution);
-            webcam.open();
+            selectedCapture = new JavaCVWebcamCapture(deviceId);
+            selectedCapture.setResolution(width, height);
+            selectedCapture.setFrameRate(10); // Low FPS for preview
+            selectedCapture.start();
 
-            System.out.println("📹 [SELECTOR] Starting preview: " + webcam.getName() +
-                    " @ " + resolution.width + "x" + resolution.height);
+            System.out.println("📹 [SELECTOR] Starting preview: Device " + deviceId +
+                    " @ " + width + "x" + height);
 
+            isPreviewRunning = true;
             previewExecutor = Executors.newScheduledThreadPool(1);
+
             previewExecutor.scheduleAtFixedRate(() -> {
+                if (!isPreviewRunning) return;
+
                 try {
-                    BufferedImage image = webcam.getImage();
+                    java.awt.image.BufferedImage image = selectedCapture.captureFrame();
 
                     if (image != null) {
                         javafx.scene.image.Image fxImage =
@@ -332,10 +366,11 @@ public class WebcamSelector {
                     System.err.println("Preview error: " + e.getMessage());
                 }
 
-            }, 0, 100, TimeUnit.MILLISECONDS); // 10 FPS preview
+            }, 0, 100, TimeUnit.MILLISECONDS); // 10 FPS
 
         } catch (Exception e) {
             System.err.println("❌ [SELECTOR] Failed to start preview: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
@@ -343,12 +378,26 @@ public class WebcamSelector {
      * Stop preview
      */
     private void stopPreview() {
+        isPreviewRunning = false;
+
         if (previewExecutor != null && !previewExecutor.isShutdown()) {
             previewExecutor.shutdown();
+            try {
+                if (!previewExecutor.awaitTermination(1, TimeUnit.SECONDS)) {
+                    previewExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                previewExecutor.shutdownNow();
+            }
         }
 
-        if (selectedWebcam != null && selectedWebcam.isOpen()) {
-            selectedWebcam.close();
+        if (selectedCapture != null) {
+            try {
+                selectedCapture.release();
+                selectedCapture = null;
+            } catch (Exception e) {
+                System.err.println("Error releasing webcam: " + e.getMessage());
+            }
         }
     }
 
@@ -357,12 +406,16 @@ public class WebcamSelector {
      */
     private void updatePreview(javafx.scene.image.Image image) {
         // Find preview panel
-        VBox previewPanel = (VBox) stage.getScene().getRoot().lookup(".center .right-panel");
+        BorderPane root = (BorderPane) stage.getScene().getRoot();
+        HBox center = (HBox) root.getCenter();
 
-        if (previewPanel != null && previewPanel.getUserData() instanceof PreviewData) {
-            PreviewData data = (PreviewData) previewPanel.getUserData();
-            data.imageView.setImage(image);
-            data.placeholderLabel.setVisible(false);
+        for (javafx.scene.Node node : center.getChildren()) {
+            if (node instanceof VBox && node.getUserData() instanceof PreviewPanelData) {
+                PreviewPanelData data = (PreviewPanelData) node.getUserData();
+                data.imageView.setImage(image);
+                data.placeholderLabel.setVisible(false);
+                break;
+            }
         }
     }
 
@@ -376,25 +429,27 @@ public class WebcamSelector {
     // ==================== HELPER CLASSES ====================
 
     private static class WebcamItem {
-        Webcam webcam;
+        JavaCVWebcamCapture.WebcamInfo webcamInfo;
 
-        WebcamItem(Webcam webcam) {
-            this.webcam = webcam;
+        WebcamItem(JavaCVWebcamCapture.WebcamInfo info) {
+            this.webcamInfo = info;
         }
 
         @Override
         public String toString() {
-            return "📹 " + webcam.getName();
+            return "📹 " + webcamInfo.name + " (" + webcamInfo.width + "x" + webcamInfo.height + ")";
         }
     }
 
     private static class ResolutionItem {
         String label;
-        Dimension dimension;
+        int width;
+        int height;
 
-        ResolutionItem(String label, Dimension dimension) {
+        ResolutionItem(String label, int width, int height) {
             this.label = label;
-            this.dimension = dimension;
+            this.width = width;
+            this.height = height;
         }
 
         @Override
@@ -404,10 +459,20 @@ public class WebcamSelector {
     }
 
     private static class PreviewData {
+        ListView<WebcamItem> listView;
+        ComboBox<ResolutionItem> resolutionCombo;
+
+        PreviewData(ListView<WebcamItem> listView, ComboBox<ResolutionItem> combo) {
+            this.listView = listView;
+            this.resolutionCombo = combo;
+        }
+    }
+
+    private static class PreviewPanelData {
         ImageView imageView;
         Label placeholderLabel;
 
-        PreviewData(ImageView imageView, Label placeholderLabel) {
+        PreviewPanelData(ImageView imageView, Label placeholderLabel) {
             this.imageView = imageView;
             this.placeholderLabel = placeholderLabel;
         }
@@ -417,18 +482,20 @@ public class WebcamSelector {
      * Webcam selection result
      */
     public static class WebcamSelection {
-        public Webcam webcam;
-        public Dimension resolution;
+        public JavaCVWebcamCapture.WebcamInfo webcamInfo;
+        public int width;
+        public int height;
 
-        public WebcamSelection(Webcam webcam, Dimension resolution) {
-            this.webcam = webcam;
-            this.resolution = resolution;
+        public WebcamSelection(JavaCVWebcamCapture.WebcamInfo info, int width, int height) {
+            this.webcamInfo = info;
+            this.width = width;
+            this.height = height;
         }
 
         @Override
         public String toString() {
             return String.format("Webcam: %s, Resolution: %dx%d",
-                    webcam.getName(), resolution.width, resolution.height);
+                    webcamInfo.name, width, height);
         }
     }
 
@@ -442,23 +509,49 @@ public class WebcamSelector {
     public static class TestApp extends javafx.application.Application {
         @Override
         public void start(Stage primaryStage) {
+            VBox root = new VBox(20);
+            root.setAlignment(Pos.CENTER);
+            root.setPadding(new Insets(50));
+            root.setStyle("-fx-background-color: #1e1e2e;");
+
+            Label title = new Label("🧪 Webcam Selector Test");
+            title.setFont(Font.font("Segoe UI", FontWeight.BOLD, 24));
+            title.setStyle("-fx-text-fill: white;");
+
             Button selectBtn = new Button("Select Webcam");
+            selectBtn.setPrefWidth(200);
+            selectBtn.setPrefHeight(50);
+            selectBtn.setStyle(
+                    "-fx-background-color: #3b82f6;" +
+                            "-fx-text-fill: white;" +
+                            "-fx-font-size: 16px;" +
+                            "-fx-font-weight: bold;"
+            );
+
+            Label resultLabel = new Label("No webcam selected");
+            resultLabel.setStyle("-fx-text-fill: #9ca3af;");
+            resultLabel.setWrapText(true);
+            resultLabel.setMaxWidth(400);
+            resultLabel.setAlignment(Pos.CENTER);
+
             selectBtn.setOnAction(e -> {
                 WebcamSelector selector = new WebcamSelector();
                 WebcamSelection selection = selector.selectWebcam();
 
                 if (selection != null) {
+                    resultLabel.setText("✅ Selected:\n" + selection.toString());
+                    resultLabel.setStyle("-fx-text-fill: #10b981;");
                     System.out.println("Selected: " + selection);
                 } else {
+                    resultLabel.setText("❌ Selection cancelled");
+                    resultLabel.setStyle("-fx-text-fill: #ef4444;");
                     System.out.println("Selection cancelled");
                 }
             });
 
-            VBox root = new VBox(20, selectBtn);
-            root.setAlignment(Pos.CENTER);
-            root.setPadding(new Insets(50));
+            root.getChildren().addAll(title, selectBtn, resultLabel);
 
-            Scene scene = new Scene(root, 400, 300);
+            Scene scene = new Scene(root, 600, 400);
             primaryStage.setScene(scene);
             primaryStage.setTitle("Webcam Selector Test");
             primaryStage.show();
